@@ -1,61 +1,59 @@
 """
-Teste de ponta a ponta: com os servicos no ar, indexa os documentos, faz uma
-pergunta e confere que a resposta vem fundamentada nos documentos.
+Teste de ponta a ponta, repetivel: pode rodar quantas vezes quiser, com o indice
+vazio ou ja cheio. Cada execucao usa um documento com marcador e origem UNICOS, entao
+nao depende do que ja esta indexado.
+
+Confere: indexacao assincrona pela fila, idempotencia (reenvio nao duplica) e uma
+pergunta cuja resposta vem do documento certo. Os documentos de teste ficam no indice
+(ele nao tem rota de remocao); sao pequenos e identificaveis pelo prefixo "teste-".
 
 Uso:  python scripts/teste_ponta_a_ponta.py
 """
-import os
-import sys
-import time
-from pathlib import Path
-
-import requests
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import indexar_documentos  # noqa: E402
-
-URL_INGESTAO = os.getenv("URL_INGESTAO", "http://localhost:8001")
-URL_RECUPERACAO = os.getenv("URL_RECUPERACAO", "http://localhost:8002")
-URL_GERACAO = os.getenv("URL_GERACAO", "http://localhost:8003")
-
-
-def esperar(condicao, descricao, limite=60):
-    inicio = time.time()
-    while time.time() - inicio < limite:
-        try:
-            if condicao():
-                return
-        except requests.RequestException:
-            pass
-        time.sleep(1)
-    sys.exit(f"FALHOU: tempo esgotado esperando {descricao}")
+import apoio
+from apoio import conferir
 
 
 def main():
-    for nome, url in (("ingestao", URL_INGESTAO), ("recuperacao", URL_RECUPERACAO),
-                      ("geracao", URL_GERACAO)):
-        esperar(lambda url=url: requests.get(f"{url}/saude", timeout=2).ok,
-                f"servico de {nome}")
-    print("1. os tres servicos estao de pe")
+    print("1. servicos no ar")
+    apoio.esperar_servicos()
+    conferir(True, "ingestao, recuperacao e geracao respondendo em /saude")
 
-    enviados = indexar_documentos.main()
-    esperar(lambda: requests.get(f"{URL_INGESTAO}/saude", timeout=2).json()["documentos"] >= enviados,
-            "o worker indexar os documentos (via fila)")
-    print(f"2. {enviados} trecho(s) passaram pela fila e foram indexados")
+    print("2. indexacao assincrona via fila")
+    doc, marcador = apoio.novo_documento()
+    conferir(apoio.contar_origem(doc["origem"]) == 0, "o documento desta execucao ainda nao existe")
+    r = apoio.indexar([doc])
+    conferir(r.status_code == 202 and r.json()["enfileirados"] == 1,
+             "POST /indexar responde 202: foi para a fila, nao indexou na hora")
+    apoio.esperar_indexado(doc["origem"])
+    conferir(True, "o worker consumiu a fila e o documento apareceu no indice")
 
-    r = requests.post(f"{URL_GERACAO}/perguntar",
-                      json={"pergunta": "o que diz o teorema CAP?"}, timeout=60)
-    if r.status_code != 200:
-        sys.exit(f"FALHOU: /perguntar devolveu {r.status_code}: {r.text}")
+    print("3. idempotencia: reenviar o mesmo documento nao duplica")
+    sentinela, _ = apoio.novo_documento(" (sentinela)")
+    apoio.indexar([doc])
+    apoio.indexar([doc, doc])
+    apoio.indexar([sentinela])       # a fila e FIFO: quando a sentinela entra, os reenvios ja passaram
+    apoio.esperar_indexado(sentinela["origem"])
+    conferir(apoio.contar_origem(doc["origem"]) == 1, "continua exatamente 1 copia apos 3 reenvios")
+
+    print("4. pergunta -> resposta fundamentada no documento")
+    r, _ = apoio.perguntar(f"o que diz o protocolo {marcador}?")
+    conferir(r.status_code == 200, f"/perguntar responde 200 (veio {r.status_code}: {r.text[:120]})")
     corpo = r.json()
-    assert corpo["resposta"], "resposta vazia"
-    assert "teorema_cap" in corpo["fontes"], f"fonte esperada ausente: {corpo['fontes']}"
-    assert any("CAP" in trecho for trecho in corpo["contexto"]), "contexto sem o trecho do CAP"
-    print("3. pergunta -> resposta fundamentada nos documentos")
-    print(f"   fontes: {corpo['fontes']}")
-    print(f"   resposta: {corpo['resposta'][:200]}")
+    conferir(bool(corpo["resposta"]), "a resposta nao e vazia")
+    conferir(corpo["fontes"][:1] == [doc["origem"]], f"a fonte principal e o documento certo: {corpo['fontes']}")
+    conferir(marcador in corpo["contexto"][0], "o contexto enviado ao LLM contem o trecho indexado")
+
+    print("5. pergunta sem relacao com nenhum documento")
+    r, _ = apoio.perguntar("xyzzyplugh" + marcador[-6:])
+    corpo = r.json()
+    conferir(r.status_code == 200 and corpo["fontes"] == [] and corpo["contexto"] == [],
+             "sem trechos relevantes: responde que nao encontrou, sem inventar fontes")
+
     print("\nOK: fluxo de ponta a ponta funcionando")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except apoio.requests.RequestException as erro:
+        apoio.falhou(f"nao consegui falar com um dos servicos: {erro}")
