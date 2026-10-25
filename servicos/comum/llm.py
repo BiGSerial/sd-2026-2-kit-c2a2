@@ -17,6 +17,42 @@ MODELO = os.getenv("LLM_MODELO", "gpt-4o-mini")
 TIMEOUT = float(os.getenv("LLM_TIMEOUT", "20"))
 
 
+def erro_transitorio(erro: Exception) -> bool:
+    """
+    True se vale a pena tentar de novo e se o erro indica indisponibilidade do LLM:
+    timeout, falha de conexao, resposta quebrada, HTTP 5xx, 408 e 429.
+    False para erros permanentes - HTTP 400, 401, 403, 404... e URL mal formada: o
+    servico respondeu, o problema esta no pedido ou na configuracao e repetir nao ajuda.
+    """
+    if isinstance(erro, requests.HTTPError):
+        if erro.response is None:       # cuidado: Response de erro 4xx e "falsa"
+            return True
+        codigo = erro.response.status_code
+        return codigo >= 500 or codigo in (408, 429)
+    if isinstance(erro, (requests.exceptions.InvalidURL,
+                         requests.exceptions.MissingSchema,
+                         requests.exceptions.InvalidSchema)):
+        return False
+    return True
+
+
+def descrever_erro(erro: Exception) -> str:
+    """
+    Descricao curta e segura do erro, para log e para a resposta ao cliente.
+    Nunca usa str(erro): as mensagens do requests trazem a URL completa, e algumas
+    APIs recebem a chave na query string.
+    """
+    if isinstance(erro, requests.HTTPError) and erro.response is not None:
+        return f"HTTP {erro.response.status_code}"
+    if isinstance(erro, requests.Timeout):
+        return "tempo-limite excedido"
+    if isinstance(erro, requests.ConnectionError):
+        return "falha de conexao"
+    if isinstance(erro, (ValueError, KeyError, IndexError, TypeError)):
+        return "resposta do LLM fora do formato esperado"
+    return type(erro).__name__
+
+
 def _simulado(pergunta, contexto):
     trechos = " ".join(contexto)[:600]
     return (

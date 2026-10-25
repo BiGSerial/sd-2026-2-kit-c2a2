@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from servicos.comum.circuit_breaker import CircuitBreaker, CircuitoAberto
-from servicos.comum.llm import gerar
+from servicos.comum.llm import descrever_erro, erro_transitorio, gerar
 
 log = logging.getLogger("geracao")
 
@@ -40,9 +40,11 @@ BACKOFF_LLM = float(os.getenv("LLM_BACKOFF", "0.5"))  # 0,5s, 1s, 2s...
 disjuntor = CircuitBreaker(
     limite_falhas=int(os.getenv("LLM_LIMITE_FALHAS", "3")),
     espera_segundos=float(os.getenv("LLM_ESPERA_CIRCUITO", "20")),
+    conta_como_falha=erro_transitorio,   # 400/401/403/404 nao abrem o circuito
 )
 # o servico de recuperacao tambem e uma dependencia remota: ganha o seu disjuntor
-disjuntor_recuperacao = CircuitBreaker(limite_falhas=3, espera_segundos=10)
+disjuntor_recuperacao = CircuitBreaker(limite_falhas=3, espera_segundos=10,
+                                       conta_como_falha=erro_transitorio)
 
 
 class Pergunta(BaseModel):
@@ -54,7 +56,11 @@ class RecuperacaoIndisponivel(Exception):
 
 
 class LLMIndisponivel(Exception):
-    pass
+    """O LLM nao respondeu (timeout, conexao, 5xx...) mesmo apos as retentativas."""
+
+
+class LLMRecusou(LLMIndisponivel):
+    """O LLM respondeu com erro permanente (400/401/403/404...): problema de configuracao."""
 
 
 def _buscar_trechos(pergunta: str) -> list:
@@ -71,15 +77,8 @@ def buscar_trechos(pergunta: str) -> list:
     except CircuitoAberto:
         raise RecuperacaoIndisponivel("servico de recuperacao com circuito aberto")
     except (requests.RequestException, ValueError, KeyError) as erro:
-        raise RecuperacaoIndisponivel(f"servico de recuperacao falhou: {erro}")
-
-
-def _transitorio(erro: Exception) -> bool:
-    """Erro 4xx (chave invalida, pedido ruim) nao melhora tentando de novo; 408/429 sim."""
-    if isinstance(erro, requests.HTTPError) and erro.response is not None:
-        codigo = erro.response.status_code
-        return codigo >= 500 or codigo in (408, 429)
-    return True  # timeout, conexao recusada, resposta quebrada...
+        raise RecuperacaoIndisponivel(
+            f"servico de recuperacao falhou: {descrever_erro(erro)}")
 
 
 def chamar_llm(pergunta: str, contexto: list) -> str:
@@ -96,12 +95,16 @@ def chamar_llm(pergunta: str, contexto: list) -> str:
             raise
         except Exception as erro:
             ultimo_erro = erro
-            log.warning("LLM falhou (tentativa %d/%d): %s",
-                        tentativa, TENTATIVAS_LLM, erro)
-            if not _transitorio(erro) or tentativa == TENTATIVAS_LLM:
+            permanente = not erro_transitorio(erro)
+            log.warning("LLM falhou (tentativa %d/%d): %s%s", tentativa, TENTATIVAS_LLM,
+                        descrever_erro(erro),
+                        " [erro permanente: nao sera repetido]" if permanente else "")
+            if permanente:
+                raise LLMRecusou(descrever_erro(erro)) from erro
+            if tentativa == TENTATIVAS_LLM:
                 break
             time.sleep(BACKOFF_LLM * 2 ** (tentativa - 1))
-    raise LLMIndisponivel(f"{type(ultimo_erro).__name__}: {ultimo_erro}")
+    raise LLMIndisponivel(descrever_erro(ultimo_erro)) from ultimo_erro
 
 
 def _fontes(trechos: list) -> list:
@@ -139,6 +142,13 @@ def perguntar(p: Pergunta):
         return JSONResponse(status_code=503, content={
             "erro": "o servico de linguagem esta instavel; o circuito foi aberto "
                     f"e novas tentativas ocorrem em ate {disjuntor.espera_segundos:g}s",
+            "degradado": True, "contexto": contexto, "fontes": fontes,
+        })
+    except LLMRecusou as erro:
+        return JSONResponse(status_code=503, content={
+            "erro": "o servico de linguagem recusou a requisicao; verifique a "
+                    "configuracao (chave, URL e modelo)",
+            "detalhe": str(erro),
             "degradado": True, "contexto": contexto, "fontes": fontes,
         })
     except LLMIndisponivel as erro:
