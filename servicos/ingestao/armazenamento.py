@@ -15,6 +15,7 @@ Apenas UM worker deve escrever (ver worker.py): nao ha trava de arquivo.
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -24,9 +25,23 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "dados"))
 ARQUIVO = DATA_DIR / "indice.json"
 
 
+def texto_indexavel(texto: str) -> bool:
+    """
+    True se o texto tem ao menos um "token" para o TF-IDF (2+ caracteres de palavra).
+    Um texto como "!!!" nao gera vocabulario: se for o unico do lote o vetorizador
+    levanta "empty vocabulary" e a mensagem seria reprocessada para sempre.
+    """
+    return re.search(r"\w\w+", texto) is not None
+
+
 def _identificador(texto: str, origem: str) -> str:
-    """Identifica um documento pelo conteudo: reenviar o mesmo nao duplica."""
-    return hashlib.sha1(f"{origem}\n{texto}".encode("utf-8")).hexdigest()
+    """
+    Identifica um documento pelo conteudo: reenviar o mesmo nao duplica.
+    O par e serializado como JSON para nao haver ambiguidade entre os campos
+    (com um separador simples, origem "x\\ny"+texto "z" colidiria com "x"+"y\\nz").
+    """
+    par = json.dumps([origem, texto], ensure_ascii=False)
+    return hashlib.sha1(par.encode("utf-8")).hexdigest()
 
 
 def carregar() -> list:
@@ -59,7 +74,9 @@ def adicionar(docs: list) -> dict:
     Documentos repetidos (mesmo texto e mesma origem) sao ignorados.
     """
     itens = carregar()
-    existentes = {i["id"] for i in itens}
+    # ids recalculados a partir do conteudo: indices gravados com a versao antiga do
+    # identificador continuam reconhecidos e sao regravados com o id novo
+    existentes = {_identificador(i["texto"], i["origem"]) for i in itens}
     novos = 0
     for d in docs:
         ident = _identificador(d["texto"], d["origem"])
@@ -70,6 +87,8 @@ def adicionar(docs: list) -> dict:
         novos += 1
 
     if novos:
+        for item in itens:
+            item["id"] = _identificador(item["texto"], item["origem"])
         vetorizador = Vetorizador()
         vetorizador.ajustar([i["texto"] for i in itens])
         for item in itens:

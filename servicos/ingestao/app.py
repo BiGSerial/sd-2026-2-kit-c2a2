@@ -38,8 +38,8 @@ class Documento(BaseModel):
     @field_validator("texto")
     @classmethod
     def texto_nao_vazio(cls, valor: str) -> str:
-        if not valor.strip():
-            raise ValueError("texto nao pode ser vazio")
+        if not armazenamento.texto_indexavel(valor):
+            raise ValueError("o texto precisa ter ao menos uma palavra (2+ caracteres)")
         return valor
 
 

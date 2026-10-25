@@ -7,11 +7,18 @@ em disco. Se o worker cair no meio, ao subir de novo ele devolve as mensagens
 pendentes para a fila. Como o indice ignora documentos repetidos, reprocessar
 uma mensagem nao duplica nada (a operacao e idempotente).
 
-Mensagens malformadas (JSON invalido ou sem texto) nao travam a fila: vao para
-uma lista de erros para inspecao.
+Recuperacao de pendentes: acontece ao iniciar E depois de QUALQUER erro do Redis.
+Uma queda de conexao no meio de um lote pode deixar mensagens em "processamento"
+com o worker vivo; sem esta segunda recuperacao elas ficariam presas ate um reinicio.
+
+Mensagens invalidas (JSON invalido, sem texto, texto sem nenhuma palavra) nao
+travam a fila: vao para uma lista de erros, de forma atomica (MULTI/EXEC), para
+inspecao manual.
 
 Rodar: python -m servicos.ingestao.worker
-Execute UM unico worker (ele e o unico escritor do arquivo de indice).
+Execute UM unico worker (ele e o unico escritor do arquivo de indice; um segundo
+worker "devolveria" as mensagens em andamento do primeiro ao iniciar).
+Requer Redis 6.2+ (BLMOVE/LMOVE).
 """
 import json
 import logging
@@ -27,7 +34,8 @@ FILA = os.getenv("FILA_INGESTAO", "fila:ingestao")
 FILA_PROCESSANDO = FILA + ":processando"
 FILA_ERROS = FILA + ":erros"
 TAMANHO_LOTE = int(os.getenv("WORKER_TAMANHO_LOTE", "50"))
-ESPERA_BLOQUEIO = 5  # segundos esperando mensagem antes de dar uma volta no laco
+ESPERA_BLOQUEIO = 5   # segundos esperando mensagem antes de dar uma volta no laco
+ESPERA_ERRO = 2       # segundos de pausa depois de uma falha
 
 log = logging.getLogger("worker-ingestao")
 
@@ -38,7 +46,11 @@ def conectar() -> redis.Redis:
 
 
 def recuperar_pendentes(r: redis.Redis) -> int:
-    """Devolve para a fila as mensagens que ficaram em processamento (queda anterior)."""
+    """
+    Devolve para a fila, na ordem original, tudo o que esta em processamento.
+    Cada mensagem e movida atomicamente (LMOVE): nunca existe uma janela em que
+    ela nao esteja em nenhuma das duas listas.
+    """
     devolvidas = 0
     while r.lmove(FILA_PROCESSANDO, FILA, "RIGHT", "LEFT") is not None:
         devolvidas += 1
@@ -50,11 +62,20 @@ def _validar(bruto: str):
     try:
         doc = json.loads(bruto)
         texto, origem = doc["texto"], doc.get("origem", "desconhecida")
-        if isinstance(texto, str) and texto.strip() and isinstance(origem, str):
+        if (isinstance(texto, str) and isinstance(origem, str)
+                and armazenamento.texto_indexavel(texto)):
             return {"texto": texto, "origem": origem}
     except (ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
+
+
+def _descartar(r: redis.Redis, bruto: str) -> None:
+    """Move a mensagem de "processando" para a fila de erros, em uma unica transacao."""
+    pipe = r.pipeline()  # MULTI/EXEC: ou faz as duas coisas, ou nenhuma
+    pipe.rpush(FILA_ERROS, bruto)
+    pipe.lrem(FILA_PROCESSANDO, 1, bruto)
+    pipe.execute()
 
 
 def processar_lote(r: redis.Redis, brutos: list) -> None:
@@ -63,69 +84,75 @@ def processar_lote(r: redis.Redis, brutos: list) -> None:
         doc = _validar(bruto)
         if doc is None:
             log.warning("mensagem invalida enviada para %s: %.80s", FILA_ERROS, bruto)
-            r.rpush(FILA_ERROS, bruto)
+            _descartar(r, bruto)
         else:
-            validos.append(doc)
+            validos.append((bruto, doc))
 
     if validos:
-        resultado = armazenamento.adicionar(validos)  # grava em disco
+        resultado = armazenamento.adicionar([doc for _, doc in validos])  # grava em disco
         log.info("lote de %d documento(s): %d novo(s), indice com %d",
                  len(validos), resultado["novos"], resultado["total"])
 
-    # so apos gravar: a mensagem deixa de estar "em processamento"
-    for bruto in brutos:
+    # so apos gravar: a mensagem deixa de estar "em processamento". Se cair aqui, o
+    # reinicio devolve o que sobrou e o indice ignora o repetido.
+    for bruto, _ in validos:
         r.lrem(FILA_PROCESSANDO, 1, bruto)
 
 
-def devolver_lote(r: redis.Redis, brutos: list) -> None:
-    """Falha ao processar: recoloca as mensagens no inicio da fila, na ordem original."""
-    for bruto in reversed(brutos):
-        r.lrem(FILA_PROCESSANDO, 1, bruto)
-        r.lpush(FILA, bruto)
+class Worker:
 
+    def __init__(self, r: redis.Redis):
+        self.r = r
+        self.recuperar = True   # ao iniciar e depois de qualquer erro do Redis
 
-def executar() -> None:
-    r = conectar()
-    while True:
+    def passo(self, espera_bloqueio: int = ESPERA_BLOQUEIO) -> int:
+        """
+        Uma volta do laco: consome e processa um lote. Devolve quantas mensagens
+        processou (0 se a fila estava vazia). Erros sobem para quem chamou.
+        """
+        r = self.r
         try:
-            devolvidas = recuperar_pendentes(r)
-            if devolvidas:
-                log.info("%d mensagem(ns) pendente(s) devolvida(s) para a fila", devolvidas)
-            break
-        except redis.RedisError as erro:
-            log.warning("aguardando o Redis: %s", erro)
-            time.sleep(2)
+            if self.recuperar:
+                devolvidas = recuperar_pendentes(r)
+                if devolvidas:
+                    log.info("%d mensagem(ns) pendente(s) devolvida(s) para a fila", devolvidas)
+                self.recuperar = False
 
-    log.info("worker pronto, consumindo %s em %s", FILA, REDIS_URL)
-    while True:
-        lote = []
-        try:
-            primeira = r.blmove(FILA, FILA_PROCESSANDO, ESPERA_BLOQUEIO, "LEFT", "RIGHT")
+            primeira = r.blmove(FILA, FILA_PROCESSANDO, espera_bloqueio, "LEFT", "RIGHT")
             if primeira is None:
-                continue
-            lote.append(primeira)
+                return 0
+            lote = [primeira]
             while len(lote) < TAMANHO_LOTE:
                 proxima = r.lmove(FILA, FILA_PROCESSANDO, "LEFT", "RIGHT")
                 if proxima is None:
                     break
                 lote.append(proxima)
-            processar_lote(r, lote)
+
+            try:
+                processar_lote(r, lote)
+            except redis.RedisError:
+                raise
+            except Exception:
+                log.exception("falha ao processar o lote; devolvendo para a fila")
+                self.recuperar = True   # a proxima volta devolve o que ficou em processamento
+                raise
+            return len(lote)
+        except redis.RedisError:
+            self.recuperar = True       # o que estava em processamento volta na proxima volta
+            raise
+
+
+def executar() -> None:
+    worker = Worker(conectar())
+    log.info("worker pronto, consumindo %s em %s", FILA, REDIS_URL)
+    while True:
+        try:
+            worker.passo()
         except redis.RedisError as erro:
-            # Redis fora do ar: as mensagens que ja estavam em processamento serao
-            # recuperadas na proxima volta, quando a conexao voltar.
             log.warning("Redis indisponivel (%s); tentando de novo", erro)
-            time.sleep(2)
-            try:
-                recuperar_pendentes(r)
-            except redis.RedisError:
-                pass
+            time.sleep(ESPERA_ERRO)
         except Exception:
-            log.exception("falha ao processar o lote; devolvendo para a fila")
-            try:
-                devolver_lote(r, lote)
-            except redis.RedisError:
-                pass
-            time.sleep(2)
+            time.sleep(ESPERA_ERRO)   # ja registrado por passo()
 
 
 if __name__ == "__main__":
