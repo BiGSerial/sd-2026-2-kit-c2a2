@@ -32,3 +32,6 @@
 - [x] Desligue a internet: o modo simulado do LLM mantem o sistema de pe?
 - [x] Derrube o servico de recuperacao: o disjuntor abre como esperado?
 - [x] A chave da API esta FORA do codigo (em variavel de ambiente)?
+- [x] Testes automatizados passando: `python -m unittest discover -s tests`
+- [ ] Rodar `docker compose up --build` do zero na sua maquina e `python scripts/teste_ponta_a_ponta.py`
+      (a build das imagens nao foi exercitada no ambiente de revisao)
