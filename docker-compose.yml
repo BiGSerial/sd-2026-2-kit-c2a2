@@ -5,6 +5,12 @@
 #                        +--> LLM (externo, protegido)            +--- fila Redis ------+
 #
 # Variaveis (opcionais) sao lidas do arquivo .env; sem LLM_API_KEY o LLM roda em modo simulado.
+#
+# Portas: tudo e publicado SO em 127.0.0.1 (acesso da propria maquina). O Redis nao tem
+# senha e fica sempre em 127.0.0.1. Para abrir as APIs na rede (ex.: VM na nuvem), defina
+# BIND_ADDR=0.0.0.0 no .env - e proteja-as com firewall.
+# Reinicio: todos os servicos usam "unless-stopped" (voltam apos falha ou reboot do Docker,
+# mas nao depois de um "docker compose stop" manual).
 
 x-saude: &saude
   interval: 5s
@@ -18,7 +24,8 @@ services:
     command: ["redis-server", "--appendonly", "yes"]   # a fila sobrevive a reinicio do Redis
     volumes:
       - redis_dados:/data
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]   # sem senha: nunca exponha na rede
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -34,8 +41,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_DIR: /dados
     volumes:
-      - indice:/dados
-    ports: ["8001:8001"]
+      - indice:/dados:ro               # a API so le o indice; quem escreve e o worker
+    ports: ["${BIND_ADDR:-127.0.0.1}:8001:8001"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -67,9 +75,11 @@ services:
       dockerfile: servicos/recuperacao/Dockerfile
     environment:
       URL_INGESTAO: http://ingestao:8001
-    ports: ["8002:8002"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:8002:8002"]
+    restart: unless-stopped
     depends_on:
-      - ingestao
+      ingestao:
+        condition: service_healthy
     healthcheck:
       <<: *saude
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/saude', timeout=3)"]
@@ -89,9 +99,11 @@ services:
       LLM_BACKOFF: ${LLM_BACKOFF:-0.5}                   # espera inicial entre tentativas (s)
       LLM_LIMITE_FALHAS: ${LLM_LIMITE_FALHAS:-3}         # falhas seguidas que abrem o circuito
       LLM_ESPERA_CIRCUITO: ${LLM_ESPERA_CIRCUITO:-20}    # segundos com o circuito aberto
-    ports: ["8003:8003"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:8003:8003"]
+    restart: unless-stopped
     depends_on:
-      - recuperacao
+      recuperacao:
+        condition: service_healthy
     healthcheck:
       <<: *saude
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/saude', timeout=3)"]
@@ -103,7 +115,11 @@ services:
     command: ["python", "/scripts/llm_falso.py", "9000"]
     volumes:
       - ./scripts:/scripts:ro
-    ports: ["9000:9000"]
+    ports: ["127.0.0.1:9000:9000"]
+    restart: unless-stopped
+    healthcheck:
+      <<: *saude
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/modo', timeout=3)"]
 
 volumes:
   redis_dados:
