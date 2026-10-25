@@ -1,43 +1,158 @@
 """
 Servico 3 - GERACAO: monta o prompt com o contexto e chama o LLM.
 
-TAREFA 3: proteger a chamada ao LLM com o circuit breaker.
+Fluxo de /perguntar:
+  1. pede os trechos mais relevantes ao servico de recuperacao (REST);
+  2. chama o LLM com esses trechos como contexto;
+  3. devolve a resposta junto com os trechos e as fontes que a embasaram.
+
+Protecao da chamada ao LLM (dependencia externa lenta e instavel), em camadas:
+  - TEMPO-LIMITE: cada chamada tem timeout (LLM_TIMEOUT, ver servicos/comum/llm.py);
+  - RETENTATIVA: falhas transitorias sao repetidas com espera crescente (backoff);
+  - CIRCUIT BREAKER: depois de falhas seguidas o circuito abre e as chamadas sao
+    recusadas na hora, sem esperar timeout, ate o LLM dar sinal de vida.
+Se o LLM nao responde, o servico NAO quebra: devolve 503 com a mensagem do problema
+e ainda entrega os trechos recuperados, que ja respondem a pergunta em parte.
 
 Rodar: uvicorn servicos.geracao.app:app --port 8003
 """
+import logging
 import os
+import time
 
 import requests
 from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from servicos.comum.circuit_breaker import CircuitBreaker, CircuitoAberto
 from servicos.comum.llm import gerar
 
+log = logging.getLogger("geracao")
+
 app = FastAPI(title="Geracao - C2.A2")
 URL_RECUPERACAO = os.getenv("URL_RECUPERACAO", "http://localhost:8002")
+TIMEOUT_RECUPERACAO = float(os.getenv("TIMEOUT_RECUPERACAO", "10"))
 
-disjuntor = CircuitBreaker(limite_falhas=3, espera_segundos=20)
+TENTATIVAS_LLM = int(os.getenv("LLM_TENTATIVAS", "3"))
+BACKOFF_LLM = float(os.getenv("LLM_BACKOFF", "0.5"))  # 0,5s, 1s, 2s...
+
+disjuntor = CircuitBreaker(
+    limite_falhas=int(os.getenv("LLM_LIMITE_FALHAS", "3")),
+    espera_segundos=float(os.getenv("LLM_ESPERA_CIRCUITO", "20")),
+)
+# o servico de recuperacao tambem e uma dependencia remota: ganha o seu disjuntor
+disjuntor_recuperacao = CircuitBreaker(limite_falhas=3, espera_segundos=10)
 
 
 class Pergunta(BaseModel):
-    pergunta: str
+    pergunta: str = Field(min_length=1)
+
+
+class RecuperacaoIndisponivel(Exception):
+    pass
+
+
+class LLMIndisponivel(Exception):
+    pass
+
+
+def _buscar_trechos(pergunta: str) -> list:
+    r = requests.post(f"{URL_RECUPERACAO}/buscar",
+                      json={"pergunta": pergunta, "top_k": 3},
+                      timeout=TIMEOUT_RECUPERACAO)
+    r.raise_for_status()
+    return r.json()["resultados"]
+
+
+def buscar_trechos(pergunta: str) -> list:
+    try:
+        return disjuntor_recuperacao.chamar(_buscar_trechos, pergunta)
+    except CircuitoAberto:
+        raise RecuperacaoIndisponivel("servico de recuperacao com circuito aberto")
+    except (requests.RequestException, ValueError, KeyError) as erro:
+        raise RecuperacaoIndisponivel(f"servico de recuperacao falhou: {erro}")
+
+
+def _transitorio(erro: Exception) -> bool:
+    """Erro 4xx (chave invalida, pedido ruim) nao melhora tentando de novo; 408/429 sim."""
+    if isinstance(erro, requests.HTTPError) and erro.response is not None:
+        codigo = erro.response.status_code
+        return codigo >= 500 or codigo in (408, 429)
+    return True  # timeout, conexao recusada, resposta quebrada...
+
+
+def chamar_llm(pergunta: str, contexto: list) -> str:
+    """
+    LLM com retentativa por fora do disjuntor: CADA tentativa passa pelo circuit
+    breaker e conta como falha. Assim o circuito abre depressa e, uma vez aberto,
+    as tentativas restantes sao recusadas na hora (CircuitoAberto nao e retentado).
+    """
+    ultimo_erro = None
+    for tentativa in range(1, TENTATIVAS_LLM + 1):
+        try:
+            return disjuntor.chamar(gerar, pergunta, contexto)
+        except CircuitoAberto:
+            raise
+        except Exception as erro:
+            ultimo_erro = erro
+            log.warning("LLM falhou (tentativa %d/%d): %s",
+                        tentativa, TENTATIVAS_LLM, erro)
+            if not _transitorio(erro) or tentativa == TENTATIVAS_LLM:
+                break
+            time.sleep(BACKOFF_LLM * 2 ** (tentativa - 1))
+    raise LLMIndisponivel(f"{type(ultimo_erro).__name__}: {ultimo_erro}")
+
+
+def _fontes(trechos: list) -> list:
+    """Origens dos documentos que embasaram a resposta, sem repeticao e na ordem de relevancia."""
+    vistas = []
+    for t in trechos:
+        if t["origem"] not in vistas:
+            vistas.append(t["origem"])
+    return vistas
 
 
 @app.post("/perguntar")
 def perguntar(p: Pergunta):
-    r = requests.post(f"{URL_RECUPERACAO}/buscar",
-                      json={"pergunta": p.pergunta, "top_k": 3}, timeout=10)
-    r.raise_for_status()
-    contexto = [t["texto"] for t in r.json()["resultados"]]
+    try:
+        trechos = buscar_trechos(p.pergunta)
+    except RecuperacaoIndisponivel as erro:
+        log.error("%s", erro)
+        return JSONResponse(status_code=503, content={
+            "erro": "nao foi possivel consultar os documentos no momento",
+            "detalhe": str(erro),
+        })
 
-    # TAREFA 3: envolva a chamada gerar(...) com disjuntor.chamar(...)
-    # e trate CircuitoAberto devolvendo 503 com mensagem clara.
-    resposta = gerar(p.pergunta, contexto)
+    contexto = [t["texto"] for t in trechos]
+    fontes = _fontes(trechos)
 
-    return {"pergunta": p.pergunta, "resposta": resposta, "contexto": contexto}
+    if not contexto:
+        # sem trechos relevantes nao ha com o que fundamentar: nem chama o LLM
+        return {"pergunta": p.pergunta,
+                "resposta": "Nao encontrei nos documentos indexados nada relacionado a essa pergunta.",
+                "contexto": [], "fontes": []}
+
+    try:
+        resposta = chamar_llm(p.pergunta, contexto)
+    except CircuitoAberto:
+        return JSONResponse(status_code=503, content={
+            "erro": "o servico de linguagem esta instavel; o circuito foi aberto "
+                    f"e novas tentativas ocorrem em ate {disjuntor.espera_segundos:g}s",
+            "degradado": True, "contexto": contexto, "fontes": fontes,
+        })
+    except LLMIndisponivel as erro:
+        return JSONResponse(status_code=503, content={
+            "erro": "o servico de linguagem nao respondeu; tente novamente",
+            "detalhe": str(erro),
+            "degradado": True, "contexto": contexto, "fontes": fontes,
+        })
+
+    return {"pergunta": p.pergunta, "resposta": resposta,
+            "contexto": contexto, "fontes": fontes}
 
 
 @app.get("/saude")
 def saude():
-    return {"status": "ok", "disjuntor": disjuntor.estado}
+    return {"status": "ok", "disjuntor": disjuntor.estado,
+            "disjuntor_recuperacao": disjuntor_recuperacao.estado}

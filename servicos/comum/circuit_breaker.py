@@ -1,14 +1,16 @@
 """
 Circuit breaker de referencia - Aula 13.
 
-Este arquivo esta COMPLETO e serve de modelo. Voce vai adapta-lo para
-proteger a chamada ao LLM no servico de geracao.
-
 Estados:
   fechado  -> deixa passar (normal)
   aberto   -> recusa na hora, sem tentar (servico esta quebrado)
   meio     -> deixa passar UMA chamada de teste para ver se voltou
+
+Adaptacoes sobre o modelo do kit: o estado e protegido por um lock (o FastAPI
+atende requisicoes em varias threads) e, no estado "meio", so UMA chamada de
+teste passa de cada vez; as demais continuam recusadas ate o teste terminar.
 """
+import threading
 import time
 
 
@@ -24,13 +26,21 @@ class CircuitBreaker:
         self.falhas = 0
         self.estado = "fechado"
         self.aberto_em = 0.0
+        self._testando = False
+        self._trava = threading.Lock()
 
     def chamar(self, funcao, *args, **kwargs):
-        if self.estado == "aberto":
-            if time.time() - self.aberto_em >= self.espera_segundos:
-                self.estado = "meio"
-            else:
-                raise CircuitoAberto("disjuntor aberto: chamada recusada")
+        with self._trava:
+            if self.estado == "aberto":
+                if time.time() - self.aberto_em >= self.espera_segundos:
+                    self.estado = "meio"
+                    self._testando = False
+                else:
+                    raise CircuitoAberto("disjuntor aberto: chamada recusada")
+            if self.estado == "meio":
+                if self._testando:
+                    raise CircuitoAberto("disjuntor em teste: chamada recusada")
+                self._testando = True
         try:
             resultado = funcao(*args, **kwargs)
         except Exception:
@@ -40,11 +50,15 @@ class CircuitBreaker:
         return resultado
 
     def _registrar_falha(self):
-        self.falhas += 1
-        if self.falhas >= self.limite_falhas or self.estado == "meio":
-            self.estado = "aberto"
-            self.aberto_em = time.time()
+        with self._trava:
+            self.falhas += 1
+            if self.falhas >= self.limite_falhas or self.estado == "meio":
+                self.estado = "aberto"
+                self.aberto_em = time.time()
+            self._testando = False
 
     def _registrar_sucesso(self):
-        self.falhas = 0
-        self.estado = "fechado"
+        with self._trava:
+            self.falhas = 0
+            self.estado = "fechado"
+            self._testando = False
