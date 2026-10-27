@@ -10,7 +10,7 @@ por recuperação), decomposto em **três microsserviços independentes** que se
 > A IA aqui é carga de trabalho, não objeto de avaliação: embeddings TF-IDF (scikit-learn,
 > offline) e um cliente de LLM com **modo simulado**, então tudo roda sem internet e sem chave.
 
-## Arquitetura
+## Arquitetura 
 
 ```mermaid
 flowchart LR
