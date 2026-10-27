@@ -302,3 +302,6 @@ Para acompanhar manualmente: `curl -X POST localhost:9000/modo/erro` quebra o LL
   validação) seria reprocessada indefinidamente (faltaria um contador de tentativas e uma fila "morta"); o timeout do LLM vale por
   etapa de rede, não como prazo total; as retentativas bloqueiam uma thread do servidor durante o backoff (o circuit breaker
   limita o efeito); o backoff não tem *jitter*.
+
+
+  
