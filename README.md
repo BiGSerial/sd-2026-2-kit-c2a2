@@ -150,7 +150,7 @@ A geração também protege a chamada à recuperação com um segundo disjuntor,
 
 ## Como executar do zero
 
-### Com Docker (recomendado)
+### Com Docker(recomendado)
 
 Requisitos: Docker com Compose.
 
