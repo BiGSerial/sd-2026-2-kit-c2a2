@@ -258,10 +258,6 @@ Para acompanhar manualmente: `curl -X POST localhost:9000/modo/erro` quebra o LL
 `/modo/lento` mudam o comportamento; `GET /contagem` mostra quantas chamadas chegaram); repita `/perguntar` e veja
 `docker compose logs geracao` e o campo `disjuntor` em `curl localhost:8003/saude`.
 
-## Contribuidores
-
-- Yasmin Cordeiro
-
 ## Variáveis de ambiente
 
 | Variável | Padrão | Serviço | Efeito |
@@ -307,5 +303,9 @@ Para acompanhar manualmente: `curl -X POST localhost:9000/modo/erro` quebra o LL
   etapa de rede, não como prazo total; as retentativas bloqueiam uma thread do servidor durante o backoff (o circuit breaker
   limita o efeito); o backoff não tem *jitter*.
 
+## Contribuidores
 
-  
+- Eve Chalabi
+- Yasmin Neumann
+- Yasmin Sousa
+- Wilton Carvalho
