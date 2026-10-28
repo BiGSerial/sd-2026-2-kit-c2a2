@@ -258,6 +258,10 @@ Para acompanhar manualmente: `curl -X POST localhost:9000/modo/erro` quebra o LL
 `/modo/lento` mudam o comportamento; `GET /contagem` mostra quantas chamadas chegaram); repita `/perguntar` e veja
 `docker compose logs geracao` e o campo `disjuntor` em `curl localhost:8003/saude`.
 
+## Contribuidores
+
+- Yasmin Cordeiro
+
 ## Variáveis de ambiente
 
 | Variável | Padrão | Serviço | Efeito |
